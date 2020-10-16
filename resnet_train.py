@@ -32,7 +32,7 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=200, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+parser.add_argument('--start-epoch', dest='start_epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N', help='mini-batch size (default: 128)')
@@ -58,6 +58,14 @@ parser.add_argument('--save-dir', dest='save_dir',
 parser.add_argument('--save-every', dest='save_every',
                     help='Saves checkpoints at every specified number of epochs',
                     type=int, default=10)
+parser.add_argument('--device', dest='device', metavar='DEVICE', default='GPU', 
+                    choices = ['CPU', 'GPU'],
+                    help='Which device to use: CPU | GPU + (default: GPU)')
+parser.add_argument('--threads', dest='threads', type=int, default=1,
+                   help='how many threads to use, only relevant when device = CPU')
+parser.add_argument('--dataset', dest='dataset', metavar='DATASET', default='CIFAR10', choices = ['CIFAR10', 'mixup'],
+        help='Which dataset to use: CIFAR | mixup (default: CIFAR10)')
+
 best_prec1 = 0
 
 
@@ -71,14 +79,18 @@ def main():
         os.makedirs(args.save_dir)
 
     model = torch.nn.DataParallel(setup_resnet.__dict__[args.arch]())
-    model.cuda()
+    if args.device == 'GPU':
+        model.cuda()
+    else:
+        torch.set_num_threads(args.threads)
 
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
-            args.start_epoch = checkpoint['epoch']
+            print(checkpoint.keys())
+            args.start_epoch = min(checkpoint['epoch'], args.start_epoch)
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -92,26 +104,40 @@ def main():
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                      std=[0.5, 0.5, 0.5])
 
-    cvxtrain_loader = torch.utils.data.DataLoader(
+    if args.dataset=='CIFAR10':
+        train_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(32, 4),
-            transforms.ToTensor(),
-            normalize,
-        ]), download=True),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomCrop(32, 4),
+                transforms.ToTensor(),
+                normalize,
+            ]), download=True),
         batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
+    num_workers=args.workers, pin_memory=True)
+    else:
+        datasetfname = "cvxCIFAR10dataset.pkl"
+        with open(datasetfname, 'rb') as infile:
+            mixup_dataset  = torch.load(infile)
+        train_loader = torch.utils.data.DataLoader(mixup_dataset, 
+                batch_size=args.batch_size, 
+                shuffle=True, 
+                num_workers=args.workers, 
+                pin_memory=True)
+
 
     val_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
             transforms.ToTensor(),
             normalize,
-        ])),
+        ]), download=True),
         batch_size=128, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    if args.device == 'GPU':
+        criterion = nn.CrossEntropyLoss().cuda()
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     if args.half:
         model.half()
@@ -174,37 +200,90 @@ def train(train_loader, model, criterion, optimizer, epoch):
     # switch to train mode
     model.train()
 
+    def mixup_data(input, twotargets, weights):
+        targets_a = twotargets[:,0]
+        targets_b = twotargets[:,1]
+        wa = weights[:,0]
+        wb = weights[:,1]
+        targets_a = targets_a.squeeze()
+        targets_b = targets_b.squeeze()
+        wa = wa.squeeze()
+        wb = wb.squeeze()
+        
+        return input, targets_a, targets_b, wa, wb
+        
+    def mixup_criterion(target_a, target_b, wa, wb):
+        return lambda criterion, pred: (wa * criterion(pred, target_a) + wb * criterion(pred, target_b)).mean()
+    
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
+    for i, r in enumerate(train_loader):
+        
+        if args.dataset=='mixup':
+            data_time.update(time.time() - end)
+            
+            input, twotargets, weights = r
+            if args.device == 'GPU':
+                input, twotargets, weights = input.cuda(), twotargets.cuda(), weights.cuda()
+            
+            # generated mixed inputs, two one-hot label vectors, and mixing coefficient
+            inputs, targets_a, targets_b, wa, wb = mixup_data(input, twotargets, weights)
+            outputs = model(inputs)
+            
+            # compute output
+            loss_func = mixup_criterion(targets_a, targets_b, wa, wb)
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            loss = loss_func(criterion, outputs)
+            
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            outputs = outputs.float()
+            loss = loss.float()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            correct = (wa * predicted.eq(targets_a.data)).cpu().sum() + (wb * predicted.eq(targets_b.data)).cpu().sum()
+            prec1 = correct/input.size(0)
+            
+            # measure accuracy and record loss
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+            
+        else:
+            input, target = r
+            # measure data loading time
+            data_time.update(time.time() - end)
 
-        # measure data loading time
-        data_time.update(time.time() - end)
+            if args.device == 'GPU':
+                target = target.cuda()
+                input_var = input.cuda()
+            else:
+                input_var = input
+            target_var = target
+            if args.half:
+                input_var = input_var.half()
 
-        target = target.cuda()
-        input_var = input.cuda()
-        target_var = target
-        if args.half:
-            input_var = input_var.half()
+            # compute output
+            output = model(input_var)
+            loss = criterion(output, target_var)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            output = output.float()
+            loss = loss.float()
+            
+            # measure accuracy and record loss
+            prec1 = accuracy(output.data, target)[0]
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
 
-        output = output.float()
-        loss = loss.float()
-        # measure accuracy and record loss
-        prec1 = accuracy(output.data, target)[0]
-        losses.update(loss.item(), input.size(0))
-        top1.update(prec1.item(), input.size(0))
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
 
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
@@ -230,9 +309,13 @@ def validate(val_loader, model, criterion):
     end = time.time()
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
-            target = target.cuda()
-            input_var = input.cuda()
-            target_var = target.cuda()
+            if args.device == 'GPU':
+                target = target.cuda()
+                input_var = input.cuda()
+                target_var = target.cuda()
+            else:
+                input_var = input
+                target_var = target
 
             if args.half:
                 input_var = input_var.half()

@@ -29,7 +29,7 @@ class ConvexHullDataset(Dataset):
         Args: 
             sourcedataset : an iterable Dataset
             alpha (float): concentration parameter for the Dirichlet distribution
-            length (integer or "auto") : length of this Dataset; auto will create same length as input dataset
+            length (integer or "auto") : length of this Dataset; auto will create averageneighbors*(length of input dataset) size Dataset
             batchsize (integer): number of points per batch to use in computing the interpoint distances
             store (binary) : whether to store the data or not
             seed (integer): seed used to generate this Dataset
@@ -37,6 +37,7 @@ class ConvexHullDataset(Dataset):
             maxneighbors (integer): maximum number of nearest neighbors to store for each point
             distmetric (function): pairwise distance function used to select nearby points, must be a key in sklearn.metrics.pairwise.distance_metrics()
             transform (function): transform for image data sets
+            limitdata (integer): only works with this initial poriton of the source dataset 
         """
         
         self.sourcedataset = sourcedataset
@@ -48,7 +49,7 @@ class ConvexHullDataset(Dataset):
             
         self.alpha = alpha
         if length=="auto":
-            self.len = self.sourcelen
+            self.len = averageneighbors*self.sourcelen
         else:
             self.len = length
         
@@ -83,8 +84,13 @@ class ConvexHullDataset(Dataset):
         if self.transform is None:
             return obj
         else: 
-            return (self.transform(obj[0]), obj[1])
+            return (self.transform(obj[0]), obj[1], obj[2])
     
+    def save(self, fname):
+        del self.generator
+        with open(fname, 'wb') as fout:
+            torch.save(self, fout)
+        
     def setaverageneighbors(self, num):
         self.averageneighbors = num
      
@@ -104,14 +110,21 @@ class ConvexHullDataset(Dataset):
         
     def genitem(self, idx):
         x = 0*self.getpoint(self.testpoint)
-        y = 0*self.testtarget
+        y = torch.zeros(self.averageneighbors,1, dtype=torch.long)
+        weights = torch.tensor(self.mixcoeffs[idx])
         for i in np.arange(self.averageneighbors):
             (sx, sy) = self.sourcedataset[self.mixindices[idx, i]]
             sx = self.getpoint(sx)
             x += self.mixcoeffs[idx, i]*sx
-            sy += self.mixcoeffs[idx, i]*sy
-        return (self.givepoint(x), y)
+            y[i] = sy
+        return (self.givepoint(x), y, weights)
         
+    def getcomponents(self, idx):
+        components = []
+        for i in np.arange(self.averageneighbors):
+            components.append(self.sourcedataset[self.mixindices[idx, i]])
+        return components
+    
     def computedistances(self):
         """Computes arrays: 
                 self.distances of size (sourcelen, maxneighbors) whose ith row contains the distance of the ith datapoint in the source to its nearest neighbors

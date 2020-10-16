@@ -2,6 +2,12 @@
 fmnist/
 cifar10/
 
+# miscellany
+*.pkl
+data/
+save_resnet110-cvx/
+save_resnet110/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -131,3 +137,4 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
