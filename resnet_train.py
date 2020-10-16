@@ -15,6 +15,7 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import setup_resnet
+import numpy as np
 
 model_names = sorted(name for name in setup_resnet.__dict__
     if name.islower() and not name.startswith("__")
@@ -63,8 +64,8 @@ parser.add_argument('--device', dest='device', metavar='DEVICE', default='GPU',
                     help='Which device to use: CPU | GPU + (default: GPU)')
 parser.add_argument('--threads', dest='threads', type=int, default=1,
                    help='how many threads to use, only relevant when device = CPU')
-parser.add_argument('--dataset', dest='dataset', metavar='DATASET', default='CIFAR10', choices = ['CIFAR10', 'mixup'],
-        help='Which dataset to use: CIFAR | mixup (default: CIFAR10)')
+parser.add_argument('--dataset', dest='dataset', metavar='DATASET', default='CIFAR10', choices = ['CIFAR10', 'mixup', 'neighborhoodwatch'],
+        help='Which dataset to use: CIFAR | mixup | neighborhoodwatch (default: CIFAR10)')
 
 best_prec1 = 0
 
@@ -104,7 +105,7 @@ def main():
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                      std=[0.5, 0.5, 0.5])
 
-    if args.dataset=='CIFAR10':
+    if args.dataset in ['CIFAR10', 'mixup']:
         train_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=True, transform=transforms.Compose([
                 transforms.RandomHorizontalFlip(),
@@ -114,16 +115,15 @@ def main():
             ]), download=True),
         batch_size=args.batch_size, shuffle=True,
     num_workers=args.workers, pin_memory=True)
-    else:
+    elif args.dataset=='neighborhoodwatch' :
         datasetfname = "cvxCIFAR10dataset.pkl"
         with open(datasetfname, 'rb') as infile:
-            mixup_dataset  = torch.load(infile)
-        train_loader = torch.utils.data.DataLoader(mixup_dataset, 
+            neighbor_dataset  = torch.load(infile)
+        train_loader = torch.utils.data.DataLoader(neighbor_dataset, 
                 batch_size=args.batch_size, 
                 shuffle=True, 
                 num_workers=args.workers, 
                 pin_memory=True)
-
 
     val_loader = torch.utils.data.DataLoader(
         datasets.CIFAR10(root='./data', train=False, transform=transforms.Compose([
@@ -200,7 +200,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     # switch to train mode
     model.train()
 
-    def mixup_data(input, twotargets, weights):
+    def nwatch_data(input, twotargets, weights):
         targets_a = twotargets[:,0]
         targets_b = twotargets[:,1]
         wa = weights[:,0]
@@ -211,14 +211,36 @@ def train(train_loader, model, criterion, optimizer, epoch):
         wb = wb.squeeze()
         
         return input, targets_a, targets_b, wa, wb
+
+    def mixup_data(input, targets, alpha=1.0):
+        if alpha > 0.:
+            lam = np.random.beta(alpha, alpha, input.size()[0])
+        else:
+            lam = np.ones(input.size()[0])
         
-    def mixup_criterion(target_a, target_b, wa, wb):
+        batch_size = input.size()[0]
+        index = torch.randperm(batch_size)
+        lam = torch.Tensor(lam)
+        lam = lam[:, None, None, None] # because inputs are 3-by-32-by-32 images
+        if input.is_cuda:
+            index = index.cuda()
+            lam = lam.cuda()
+
+        mixed_input = lam * input + (1 - lam) * input[index, :]
+        target_a, target_b = targets, targets[index]
+        return mixed_input, target_a, target_b, lam
+
+        
+    def nwatch_criterion(target_a, target_b, wa, wb):
         return lambda criterion, pred: (wa * criterion(pred, target_a) + wb * criterion(pred, target_b)).mean()
     
+    def mixup_criterion(target_a, target_b, w):
+        return lambda criterion, pred: (w * criterion(pred, target_a) + (1- w) * criterion(pred, target_b)).mean()
+
     end = time.time()
     for i, r in enumerate(train_loader):
         
-        if args.dataset=='mixup':
+        if args.dataset=='neighborhoodwatch':
             data_time.update(time.time() - end)
             
             input, twotargets, weights = r
@@ -226,11 +248,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
                 input, twotargets, weights = input.cuda(), twotargets.cuda(), weights.cuda()
             
             # generated mixed inputs, two one-hot label vectors, and mixing coefficient
-            inputs, targets_a, targets_b, wa, wb = mixup_data(input, twotargets, weights)
+            inputs, targets_a, targets_b, wa, wb = nwatch_data(input, twotargets, weights)
             outputs = model(inputs)
             
             # compute output
-            loss_func = mixup_criterion(targets_a, targets_b, wa, wb)
+            loss_func = nwatch_criterion(targets_a, targets_b, wa, wb)
             criterion = nn.CrossEntropyLoss(reduction='none')
             loss = loss_func(criterion, outputs)
             
@@ -250,6 +272,38 @@ def train(train_loader, model, criterion, optimizer, epoch):
             losses.update(loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
             
+        elif args.dataset=='mixup':
+            data_time.update(time.time() - end)
+
+            input, targets = r
+            if args.device == 'GPU':
+                input, targets = input.cuda(), targets.cuda()
+
+            # generate mixed inputs, two labels, and mixing coefficient
+            inputs, targets_a, targets_b, w = mixup_data(input, targets)
+            outputs = model(inputs)
+
+            # compute output
+            loss_func = mixup_criterion(targets_a, targets_b, w)
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            loss = loss_func(criterion, outputs)
+
+            # compute gradient and do SGD step
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            outputs = outputs.float()
+            loss = loss.float()
+
+            _, predicted = torch.max(outputs.data, 1)
+            correct = (w * predicted.eq(targets_a.data)).cpu().sum() + ( (1 - w) * predicted.eq(targets_b.data)).cpu().sum()
+            prec1 = correct/input.size(0)
+
+            # measure accuracy and record loss
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+
         else:
             input, target = r
             # measure data loading time
